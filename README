@@ -1,3 +1,4 @@
-*OS-xv6-system_calls*
+OS - XV6 
+SYSTEM CALLS & SCHEDULING
 extend xv6 to support history within the shell process, operating system global variables and multiple scheduling policies.
 https://www.cs.bgu.ac.il/~os192/wiki.files/Assignment%201%20[V2]%20OS%20192.pdf
