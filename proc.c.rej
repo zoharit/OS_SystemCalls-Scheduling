@@ -1,0 +1,941 @@
+diff a/proc.c b/proc.c	(rejected hunks)
+@@ -8,13 +8,24 @@
+ #include "proc.h"
+ #include "spinlock.h"
+ 
++//all the queues we use for each policy.
+ extern PriorityQueue pq;
+ extern RoundRobinQueue rrq;
+ extern RunningProcessesHolder rpholder;
++// counts the numbers of times that any process gets running time.
++long long counter=0;
++// enum that represent the policy number that we got (RRQ= round robin queue, PQ= priority queue, EPQ= extended priority queue)
++enum CurrPolicyCase{
++  RRQ=1,
++  PQ=2,
++  EPQ=3,
++};
++// we set our priority to RRQ because its our default policy
++enum CurrPolicyCase current=RRQ;
++
+ 
+ long long getAccumulator(struct proc *p) {
+-	//Implement this function, remove the panic line.
+-	panic("getAccumulator: not implemented\n");
++  return p->accumulator;
+ }
+ 
+ struct {
+@@ -23,23 +34,110 @@ struct {
+ } ptable;
+ 
+ static struct proc *initproc;
+-
+ int nextpid = 1;
+ extern void forkret(void);
+ extern void trapret(void);
+-
+ static void wakeup1(void *chan);
+ 
++
++
++/*
++ extends the wait system call
++ the second argument is a pointer to the structure that contains:
++ ctime,ttime,stime,retime,rutime.
++*/
++int
++wait_stat(int *status,  struct perf * performance)
++{
++  struct proc *p;
++  int havekids, pid;
++  struct proc *curproc = myproc();
++  acquire(&ptable.lock);
++  for(;;){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->parent != curproc)
++        continue;
++      havekids = 1;
++      if(p->state == ZOMBIE){
++        performance->ctime = p->ctime;
++        performance->ttime = p->ttime;
++        performance->stime = p->stime;
++        performance->retime = p->retime;
++        performance->rutime = p->rutime;
++        // Found one.
++        pid = p->pid;
++        kfree(p->kstack);
++        p->kstack = 0;
++        freevm(p->pgdir);
++        p->pid = 0;
++        p->parent = 0;
++        p->name[0] = 0;
++        p->killed = 0;
++      if(status!=null){
++        *status=p->status;
++      }
++        p->state = UNUSED;
++        p->status=0;
++        p->accumulator=0;
++        p->priority=0;
++        p->last_running_time=0;
++        p->ctime = 0;
++        p->ttime = 0;
++        p->stime = 0;
++        p->retime = 0;
++        p->rutime = 0;
++   
++      release(&ptable.lock);
++      return pid;
++    }   
++  }   
++  // No point waiting if we don't have any children.
++  if(!havekids || curproc->killed){
++    release(&ptable.lock);
++    return -1;
++  }
++
++  // Wait for children to exit. (See wakeup1 call in proc_exit.)
++  sleep(curproc, &ptable.lock); //DOC: wait-sleep
++  }
++}
++
++//get the min accumulator
++long long get_min (void)
++{
++  if(pq.isEmpty())
++    return 0;
++  
++  //min_accumulator_rpholder store the min from the running queue
++  //min_accumulator_pq store the min from the runnable queue
++  long long min_accumulator_pq=0;
++  long long min_accumulator_rpholder=0;
++  if(rpholder.isEmpty()){
++    pq.getMinAccumulator(&min_accumulator_pq);
++    return min_accumulator_pq;
++  }
++  pq.getMinAccumulator(&min_accumulator_pq);
++  rpholder.getMinAccumulator(&min_accumulator_rpholder);
++  //choose the min between the running and runnable proceses
++  if(min_accumulator_pq <min_accumulator_rpholder)
++    return min_accumulator_pq;
++  
++  return min_accumulator_rpholder;  
++}
++
++
+ void
+ pinit(void)
+ {
+-  initlock(&ptable.lock, "ptable");
++ initlock(&ptable.lock, "ptable");
+ }
+ 
+ // Must be called with interrupts disabled
+ int
+ cpuid() {
+-  return mycpu()-cpus;
++ return mycpu()-cpus;
+ }
+ 
+ // Must be called with interrupts disabled to avoid the caller being
+@@ -85,33 +183,30 @@ allocproc(void)
+ {
+   struct proc *p;
+   char *sp;
+-
+   acquire(&ptable.lock);
+-
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+     if(p->state == UNUSED)
+       goto found;
+-
+   release(&ptable.lock);
+   return 0;
+-
+-found:
+-  p->state = EMBRYO;
+-  p->pid = nextpid++;
+-
++  found:
++    p->ctime = ticks;
++    p->ttime = 0;
++    p->stime = 0;
++    p->retime = 0;
++    p->rutime = 0;
++    p->state = EMBRYO;
++    p->pid = nextpid++;
+   release(&ptable.lock);
+-
+   // Allocate kernel stack.
+   if((p->kstack = kalloc()) == 0){
+     p->state = UNUSED;
+     return 0;
+   }
+   sp = p->kstack + KSTACKSIZE;
+-
+   // Leave room for trap frame.
+   sp -= sizeof *p->tf;
+   p->tf = (struct trapframe*)sp;
+-
+   // Set up new context to start executing at forkret,
+   // which returns to trapret.
+   sp -= 4;
+@@ -121,7 +216,6 @@ found:
+   p->context = (struct context*)sp;
+   memset(p->context, 0, sizeof *p->context);
+   p->context->eip = (uint)forkret;
+-
+   return p;
+ }
+ 
+@@ -132,9 +226,7 @@ userinit(void)
+ {
+   struct proc *p;
+   extern char _binary_initcode_start[], _binary_initcode_size[];
+-
+-  p = allocproc();
+-  
++  p = allocproc(); 
+   initproc = p;
+   if((p->pgdir = setupkvm()) == 0)
+     panic("userinit: out of memory?");
+@@ -147,8 +239,7 @@ userinit(void)
+   p->tf->ss = p->tf->ds;
+   p->tf->eflags = FL_IF;
+   p->tf->esp = PGSIZE;
+-  p->tf->eip = 0;  // beginning of initcode.S
+-
++  p->tf->eip = 0; // beginning of initcode.S
+   safestrcpy(p->name, "initcode", sizeof(p->name));
+   p->cwd = namei("/");
+ 
+@@ -157,12 +248,26 @@ userinit(void)
+   // writes to be visible, and the lock is also needed
+   // because the assignment might not be atomic.
+   acquire(&ptable.lock);
+-
+   p->state = RUNNABLE;
+-
++  //set the priority to 5 in every new process
++  p->last_running_time=0;
++  p->priority=5;
++  p->accumulator=get_min();
++  p->ctime=ticks;
++
++  switch(current){
++    case RRQ:
++      rrq.enqueue(p);
++      break;
++    case PQ :
++    case EPQ:
++      pq.put(p);
++      break;
++  }
+   release(&ptable.lock);
+ }
+ 
++
+ // Grow current process's memory by n bytes.
+ // Return 0 on success, -1 on failure.
+ int
+@@ -174,14 +279,14 @@ growproc(int n)
+   sz = curproc->sz;
+   if(n > 0){
+     if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
+-      return -1;
++    return -1;
+   } else if(n < 0){
+-    if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
+-      return -1;
+-  }
+-  curproc->sz = sz;
+-  switchuvm(curproc);
+-  return 0;
++             if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
++                return -1;
++            }
++   curproc->sz = sz;
++   switchuvm(curproc);
++   return 0;
+ }
+ 
+ // Create a new process copying p as the parent.
+@@ -219,30 +324,39 @@ fork(void)
+   np->cwd = idup(curproc->cwd);
+ 
+   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+-
+   pid = np->pid;
+-
+   acquire(&ptable.lock);
+-
+   np->state = RUNNABLE;
+-
++  np->priority=5;
++  np->accumulator=get_min();
++  np->last_running_time=0;
++  np->ctime=ticks;
++
++  switch(current){
++    case RRQ:
++      rrq.enqueue(np);
++      break;
++    case PQ :
++    case EPQ:
++      pq.put(np);
++      break;
++  }
+   release(&ptable.lock);
+-
+   return pid;
+-}
++  }
+ 
+-// Exit the current process.  Does not return.
++// Exit the current process. Does not return.
+ // An exited process remains in the zombie state
+ // until its parent calls wait() to find out it exited.
+ void
+-exit(void)
++exit(int status)
+ {
+   struct proc *curproc = myproc();
+   struct proc *p;
+   int fd;
+-
++  curproc->status=status;
+   if(curproc == initproc)
+-    panic("init exiting");
++  panic("init exiting");
+ 
+   // Close all open files.
+   for(fd = 0; fd < NOFILE; fd++){
+@@ -252,40 +366,40 @@ exit(void)
+     }
+   }
+ 
+-  begin_op();
+-  iput(curproc->cwd);
+-  end_op();
+-  curproc->cwd = 0;
++ begin_op();
++ iput(curproc->cwd);
++ end_op();
++ curproc->cwd = 0;
+ 
+-  acquire(&ptable.lock);
++ acquire(&ptable.lock);
+ 
+-  // Parent might be sleeping in wait().
+-  wakeup1(curproc->parent);
++ // Parent might be sleeping in wait().
++ wakeup1(curproc->parent);
+ 
+-  // Pass abandoned children to init.
+-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-    if(p->parent == curproc){
+-      p->parent = initproc;
+-      if(p->state == ZOMBIE)
+-        wakeup1(initproc);
+-    }
+-  }
++ // Pass abandoned children to init.
++ for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++  if(p->parent == curproc){
++   p->parent = initproc;
++  if(p->state == ZOMBIE)
++    wakeup1(initproc);
++ }
++}
+ 
+-  // Jump into the scheduler, never to return.
+-  curproc->state = ZOMBIE;
+-  sched();
+-  panic("zombie exit");
++ // Jump into the scheduler, never to return.
++ curproc->state = ZOMBIE;
++ curproc->ttime=ticks;
++ sched();
++ panic("zombie exit");
+ }
+ 
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+ int
+-wait(void)
++wait(int *status)
+ {
+   struct proc *p;
+   int havekids, pid;
+   struct proc *curproc = myproc();
+-  
+   acquire(&ptable.lock);
+   for(;;){
+     // Scan through table looking for exited children.
+@@ -293,7 +407,7 @@ wait(void)
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->parent != curproc)
+         continue;
+-      havekids = 1;
++    havekids = 1;
+       if(p->state == ZOMBIE){
+         // Found one.
+         pid = p->pid;
+@@ -305,22 +419,149 @@ wait(void)
+         p->name[0] = 0;
+         p->killed = 0;
+         p->state = UNUSED;
++        if(status!=null)
++          *status=p->status;
++       p->state = UNUSED;
++        //reset the fields
++        p->status=0;
++        p->accumulator=0;
++        p->priority=0;
++        p->last_running_time=0;
++        p->ctime = 0;
++        p->ttime = 0;
++        p->stime = 0;
++        p->retime = 0;
++        p->rutime = 0;
+         release(&ptable.lock);
+         return pid;
+       }
+-    }
+ 
+-    // No point waiting if we don't have any children.
+-    if(!havekids || curproc->killed){
++  }
++
++  // No point waiting if we don't have any children.
++  if(!havekids || curproc->killed){
+       release(&ptable.lock);
+       return -1;
+-    }
++  }
++ // Wait for children to exit. (See wakeup1 call in proc_exit.)
++  sleep(curproc, &ptable.lock); //DOC: wait-sleep
++ }
++}
++
++
++/*
++ round robin scheduling algorithm-
++ each runnable process becomes running
++ when it is removed from the head of the queue
++*/
++void
++Round_Robin_Scheduler( struct cpu *c)
++{
++ struct proc *p;
++  acquire(&ptable.lock);
++ if(!(rrq.isEmpty())){
++    p = rrq.dequeue();
++    if(p!=null){
++      if(p->state == RUNNABLE){
++        c->proc = p;
++        switchuvm(p);
++        p->state = RUNNING;
++        swtch(&(c->scheduler), p->context);
++        switchkvm();
++        // Process is done running for now.
++        // It should have changed its p->state before coming back.
++        c->proc = 0;
++      }
++      }
++ }
++ release(&ptable.lock);
++}
+ 
+-    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
+-    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
++
++/*
++  scheduling policy is based on accumulating the process priority (1-10)
++*/
++void Priority_Scheduler(struct cpu* c)
++{
++  acquire(&ptable.lock);
++  struct proc *p;
++  if (!pq.isEmpty()){
++    p=pq.extractMin();
++    if(p!=null){
++    if(p->state == RUNNABLE)
++    {
++      c->proc = p;
++      switchuvm(p);
++      p->state = RUNNING;
++      rpholder.add(p);
++      swtch(&(c->scheduler), p->context);
++      switchkvm();
++      c->proc = 0;
++    }
+   }
++  }
++  release(&ptable.lock);
+ }
+ 
++
++
++/*
++ scheduling policy is based on accumulating the process priority (0-10)
++*/
++void Extended_Priority_Scheduler(struct cpu* c)
++{ 
++  acquire(&ptable.lock);
++  long long minimum_ticks_time=ticks;
++  struct proc *p;
++  struct proc *min_procces=0;
++    if (!pq.isEmpty() ){
++      if ((counter!=0)&&(counter%100==0))
++      {
++          for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++            if(p->state != RUNNABLE){
++            continue;
++            }
++              if (p->last_running_time<minimum_ticks_time){
++                min_procces=p;
++                minimum_ticks_time=p->last_running_time;
++              }
++          }
++        if (min_procces!=null) {
++          pq.extractProc(min_procces);
++          p=min_procces;
++        }
++      }
++      else
++      {
++        p=pq.extractMin();
++      }
++      if(p!=null){
++        if(p->state == RUNNABLE){
++            c->proc = p;
++            switchuvm(p);
++            p->state = RUNNING;
++            rpholder.add(p);
++            swtch(&(c->scheduler), p->context);
++            switchkvm();
++            c->proc = 0;
++        }
++      }
++    }
++    release(&ptable.lock);
++}
++
++
++
++//PAGEBREAK: 42
++// Per-CPU process scheduler.
++// Each CPU calls scheduler() after setting itself up.
++// Scheduler never returns.  It loops, doing:
++//  - choose a process to run
++//  - swtch to start running that process
++//  - eventually that process transfers control
++//      via swtch back to the scheduler.
++
++
+ //PAGEBREAK: 42
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+@@ -332,40 +573,26 @@ wait(void)
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
+   struct cpu *c = mycpu();
+   c->proc = 0;
+-  
+   for(;;){
+     // Enable interrupts on this processor.
+-    sti();
+-
+-    // Loop over process table looking for process to run.
+-    acquire(&ptable.lock);
+-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-      if(p->state != RUNNABLE)
+-        continue;
+-
+-      // Switch to chosen process.  It is the process's job
+-      // to release ptable.lock and then reacquire it
+-      // before jumping back to us.
+-      c->proc = p;
+-      switchuvm(p);
+-      p->state = RUNNING;
+-
+-      swtch(&(c->scheduler), p->context);
+-      switchkvm();
+-
+-      // Process is done running for now.
+-      // It should have changed its p->state before coming back.
+-      c->proc = 0;
++      sti();
++  switch(current){
++    case RRQ:
++      Round_Robin_Scheduler(c);
++      break;
++    case PQ :
++    Priority_Scheduler(c);
++    break;
++    case EPQ:
++      Extended_Priority_Scheduler(c);
++      break;
+     }
+-    release(&ptable.lock);
+-
+   }
+ }
+ 
+-// Enter scheduler.  Must hold only ptable.lock
++// Enter scheduler. Must hold only ptable.lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+ // kernel thread, not this CPU. It should
+@@ -375,51 +602,65 @@ scheduler(void)
+ void
+ sched(void)
+ {
+-  int intena;
+-  struct proc *p = myproc();
+-
+-  if(!holding(&ptable.lock))
+-    panic("sched ptable.lock");
+-  if(mycpu()->ncli != 1)
+-    panic("sched locks");
+-  if(p->state == RUNNING)
+-    panic("sched running");
+-  if(readeflags()&FL_IF)
+-    panic("sched interruptible");
+-  intena = mycpu()->intena;
+-  swtch(&p->context, mycpu()->scheduler);
+-  mycpu()->intena = intena;
++ int intena;
++ struct proc *p = myproc();
++
++ if(!holding(&ptable.lock))
++   panic("sched ptable.lock");
++ if(mycpu()->ncli != 1)
++   panic("sched locks");
++ if(p->state == RUNNING)
++  panic("sched running");
++ if(readeflags()&FL_IF)
++  panic("sched interruptible");
++ intena = mycpu()->intena;
++ swtch(&p->context, mycpu()->scheduler);
++ mycpu()->intena = intena;
+ }
+ 
+ // Give up the CPU for one scheduling round.
+ void
+ yield(void)
+ {
+-  acquire(&ptable.lock);  //DOC: yieldlock
++  acquire(&ptable.lock); //DOC: yieldlock
+   myproc()->state = RUNNABLE;
+-  sched();
+-  release(&ptable.lock);
++  //the process changed from running to runnable- its accumolator doesn't change
++  rpholder.remove(myproc());
++  myproc()->last_running_time = ticks;
++  counter++;
++  switch(current){
++    case RRQ:
++      rrq.enqueue(myproc());
++      break;
++    case PQ :
++    case EPQ:
++      myproc()->accumulator=myproc()->accumulator+myproc()->priority;
++      pq.put(myproc());
++      break;
++ }
++
++ sched();
++ release(&ptable.lock);
+ }
+ 
+ // A fork child's very first scheduling by scheduler()
+-// will swtch here.  "Return" to user space.
++// will swtch here. "Return" to user space.
+ void
+ forkret(void)
+ {
+-  static int first = 1;
+-  // Still holding ptable.lock from scheduler.
+-  release(&ptable.lock);
+-
+-  if (first) {
+-    // Some initialization functions must be run in the context
+-    // of a regular process (e.g., they call sleep), and thus cannot
+-    // be run from main().
+-    first = 0;
+-    iinit(ROOTDEV);
+-    initlog(ROOTDEV);
+-  }
+-
+-  // Return to "caller", actually trapret (see allocproc).
++ static int first = 1;
++ // Still holding ptable.lock from scheduler.
++ release(&ptable.lock);
++ if (first) {
++ // Some initialization functions must be run in the context
++ // of a regular process (e.g., they call sleep), and thus cannot
++ // be run from main().
++ first = 0;
++ iinit(ROOTDEV);
++ initlog(ROOTDEV);
++ }
++
++ // Return to "caller", actually trapret (see allocproc).
+ }
+ 
+ // Atomically release lock and sleep on chan.
+@@ -430,7 +671,7 @@ sleep(void *chan, struct spinlock *lk)
+   struct proc *p = myproc();
+   
+   if(p == 0)
+-    panic("sleep");
++   panic("sleep");
+ 
+   if(lk == 0)
+     panic("sleep without lk");
+@@ -441,13 +682,14 @@ sleep(void *chan, struct spinlock *lk)
+   // guaranteed that we won't miss any wakeup
+   // (wakeup runs with ptable.lock locked),
+   // so it's okay to release lk.
+-  if(lk != &ptable.lock){  //DOC: sleeplock0
+-    acquire(&ptable.lock);  //DOC: sleeplock1
++  if(lk != &ptable.lock){ //DOC: sleeplock0
++    acquire(&ptable.lock); //DOC: sleeplock1
+     release(lk);
+   }
+   // Go to sleep.
+   p->chan = chan;
+   p->state = SLEEPING;
++  rpholder.remove(p);
+ 
+   sched();
+ 
+@@ -455,7 +697,7 @@ sleep(void *chan, struct spinlock *lk)
+   p->chan = 0;
+ 
+   // Reacquire original lock.
+-  if(lk != &ptable.lock){  //DOC: sleeplock2
++  if(lk != &ptable.lock){ //DOC: sleeplock2
+     release(&ptable.lock);
+     acquire(lk);
+   }
+@@ -467,11 +709,22 @@ sleep(void *chan, struct spinlock *lk)
+ static void
+ wakeup1(void *chan)
+ {
+-  struct proc *p;
++  struct proc *p; 
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+-    if(p->state == SLEEPING && p->chan == chan)
++    if(p->state == SLEEPING && p->chan == chan){
+       p->state = RUNNABLE;
++      p->accumulator=get_min();
++      switch(current){
++        case RRQ:
++          rrq.enqueue(p);
++          break;
++        case PQ :
++        case EPQ:
++          pq.put(p);
++          break;
++      }
++    }
+ }
+ 
+ // Wake up all processes sleeping on chan.
+@@ -490,36 +743,48 @@ int
+ kill(int pid)
+ {
+   struct proc *p;
+-
+   acquire(&ptable.lock);
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+     if(p->pid == pid){
+       p->killed = 1;
+       // Wake process from sleep if necessary.
+-      if(p->state == SLEEPING)
++      if(p->state == SLEEPING){
+         p->state = RUNNABLE;
++        p->accumulator=get_min();
++         switch (current){
++            case RRQ:
++              rrq.enqueue(p);
++            break;
++            case PQ:
++              pq.put(p);
++            break;
++            case EPQ:
++              pq.put(p);
++            break;
++          }
++      }
+       release(&ptable.lock);
+       return 0;
+-    }
++      }
+   }
+   release(&ptable.lock);
+   return -1;
+ }
+ 
+ //PAGEBREAK: 36
+-// Print a process listing to console.  For debugging.
++// Print a process listing to console. For debugging.
+ // Runs when user types ^P on console.
+ // No lock to avoid wedging a stuck machine further.
+ void
+ procdump(void)
+ {
+   static char *states[] = {
+-  [UNUSED]    "unused",
+-  [EMBRYO]    "embryo",
+-  [SLEEPING]  "sleep ",
+-  [RUNNABLE]  "runble",
+-  [RUNNING]   "run   ",
+-  [ZOMBIE]    "zombie"
++  [UNUSED] "unused",
++  [EMBRYO] "embryo",
++  [SLEEPING] "sleep ",
++  [RUNNABLE] "runble",
++  [RUNNING] "run ",
++  [ZOMBIE] "zombie"
+   };
+   int i;
+   struct proc *p;
+@@ -532,13 +797,122 @@ procdump(void)
+     if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+       state = states[p->state];
+     else
+-      state = "???";
+-    cprintf("%d %s %s", p->pid, state, p->name);
++    state = "???";
++  cprintf("%d %s %s", p->pid, state, p->name);
+     if(p->state == SLEEPING){
+       getcallerpcs((uint*)p->context->ebp+2, pc);
+-      for(i=0; i<10 && pc[i] != 0; i++)
+-        cprintf(" %p", pc[i]);
++    for(i=0; i<10 && pc[i] != 0; i++)
++      cprintf(" %p", pc[i]);
++    }
++  cprintf("\n");
++  }
++}
++
++int
++detach(int pid)
++{
++  struct proc *p;
++  struct proc *curproc = myproc();
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->pid==pid && p->parent == curproc ){
++      p->parent=initproc;
++      release(&ptable.lock);
++      return 0;
++    }
++  }
++  release(&ptable.lock);
++  return -1;
++}
++
++//Set the priority of a process to the varible that we get
++void 
++priority(int prio){
++  acquire(&ptable.lock);
++  switch(current){
++    case RRQ:
++    case PQ:
++    if(prio>0&& prio<11){
++      myproc()->priority=prio;     
++    }
++    else{
++      myproc()->priority=5;
++    }
++    break;
++    case EPQ:
++      if(prio>-1 && prio <11){
++        myproc()->priority=prio;
++      }
++      else{
++      myproc()->priority=5;
+     }
+-    cprintf("\n");
++    break;
+   }
++ 
++ release(&ptable.lock);
+ }
++
++void
++update_fields(void)
++{
++  struct proc *p;
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->state == UNUSED || p==initproc)
++    continue;
++    if(p->state == RUNNING)
++    {
++        p->rutime++;
++    }
++    if(p->state == RUNNABLE)
++    {
++          p->retime++;
++    }
++        if(p->state == SLEEPING)
++    {
++        p->stime++;
++    }
++  }
++}
++
++//when we are moving to policy RRQ
++void change_accumulator_to_zero(){
++   struct proc *p;
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      p->accumulator=0;
++    }
++}
++
++//when we are moving to policy PQ 
++void change_priority_from_zero_to_one()
++{  
++   struct proc *p;
++   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++      if(p->priority==0){
++        p->priority=1;
++      }
++    }
++}
++
++
++void policy(int pol)
++{
++  acquire(&ptable.lock);
++  if(pol==RRQ){
++        change_accumulator_to_zero();
++        pq.switchToRoundRobinPolicy();
++        current=pol;
++  }
++   else if(pol==PQ || pol==EPQ){
++          if(pol==PQ){
++            change_priority_from_zero_to_one();
++          }
++          //this will happend anyway. 
++          rrq.switchToPriorityQueuePolicy();
++          current=pol;
++      }
++   else{
++        current=RRQ;
++        pq.switchToRoundRobinPolicy();
++    }
++  release(&ptable.lock);
++}
+\ No newline at end of file

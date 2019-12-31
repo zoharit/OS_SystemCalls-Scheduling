@@ -1,0 +1,44 @@
+diff a/defs.h b/defs.h	(rejected hunks)
+@@ -104,7 +105,7 @@ int             pipewrite(struct pipe*, char*, int);
+ //PAGEBREAK: 16
+ // proc.c
+ int             cpuid(void);
+-void            exit(void);
++void            exit(int status);
+ int             fork(void);
+ int             growproc(int);
+ int             kill(int);
+@@ -113,17 +114,21 @@ struct proc*    myproc();
+ void            pinit(void);
+ void            procdump(void);
+ void            scheduler(void) __attribute__((noreturn));
++void            schedulerRR(struct proc *p, struct cpu* c);
+ void            sched(void);
+ void            setproc(struct proc*);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+-int             wait(void);
++int             wait(int *status);
++int             detach(int pid);
++void            priority(int acc);
+ void            wakeup(void*);
+ void            yield(void);
+-
+-// swtch.S
++void            policy(int pol);
++int             wait_stat(int * status, struct perf * performance);
++//void Priority_Scheduler(struct cpu* c);
++//void Extended_Priority_Scheduler(struct cpu* c);
+ void            swtch(struct context**, struct context*);
+-
+ // spinlock.c
+ void            acquire(struct spinlock*);
+ void            getcallerpcs(void*, uint*);
+@@ -148,6 +155,7 @@ int             strlen(const char*);
+ int             strncmp(const char*, const char*, uint);
+ char*           strncpy(char*, const char*, int);
+ 
++
+ // syscall.c
+ int             argint(int, int*);
+ int             argptr(int, char**, int);
